@@ -1,62 +1,144 @@
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Random;
 
 /**
- * Game rules. Replaces Foxy/Freddy/Bonnie/Chicka: instead of animatronics moving
- * toward the office, the flood rises in each area and random storm events hit.
- * Call tick(dt) with the elapsed seconds (the UI calls it every 100 ms).
+ * Game rules. ENCAPSULATION: all state is private; the UI only sees getters and
+ * validated action methods, and never touches Area or Office directly.
+ * POLYMORPHISM: areas and hazards are stored by their base types (Area, Hazard)
+ * and each subclass behaves differently when the same method is called.
  */
 public class FloodEngine {
 	// ---- Tunables (balance here) ----
 	public static final double NIGHT_SECONDS = 360; // real seconds for 12AM -> 6AM
-	public static final double WALL_DURATION = 25; // seconds a wall holds
+	public static final double WALL_DURATION = 25;
 	public static final double REBOOT_TIME = 8;
 	public static final double PATCH_TIME = 3;
 	public static final double FIX_TIME = 4;
 	public static final double BASE_RATE = 0.15; // % per second at 12AM
-	public static final double RATE_PER_HOUR = 0.05; // extra % per second each hour
-	public static final double CHANCE_BLACKOUT = 0.003; // per second
-	public static final double CHANCE_WINDOW = 0.006;
-	public static final double CHANCE_PIPE = 0.006;
+	public static final double RATE_PER_HOUR = 0.05;
+	public static final double DEFAULT_TICK = 0.1;
 
-	public final Area[] areas;
-	public final Office office = new Office();
-	public double elapsed = 0;
-	public boolean won = false;
-	public boolean lost = false; // drowned -> alligator jumpscare
-	public String alert = ""; // latest event message for the HUD
-	public double alertTime = 0;
-	public double difficulty; // 1.0 = normal
-
+	private final List<Area> areas = new ArrayList<Area>();
+	private final List<Hazard> hazards = new ArrayList<Hazard>();
+	private final Office office = new Office();
 	private final Random rng = new Random();
+	private final double difficulty; // 1.0 = normal
+	private double elapsed = 0;
+	private boolean won = false;
+	private boolean lost = false;
+	private String alert = "";
+	private double alertTime = 0;
 
-	public FloodEngine(double difficulty) {
-		this.difficulty = difficulty;
-		areas = new Area[] {
-			new Area("RUBBLE LOT", "cam1.png", 1.0),
-			new Area("GREEN HOUSE", "cam2.png", 1.0),
-			new Area("MAIN ROAD", "cam3.png", 1.1),
-			new Area("CREEK BANK", "cam4.png", 1.2),
-			new Area("MARKET ALLEY", "cam5.png", 0.9),
-			new Area("BARANGAY GATE", "cam6.png", 0.8)
-		};
+	/** OVERLOADED constructor: normal difficulty. */
+	public FloodEngine() {
+		this(1.0);
 	}
 
-	// ---------- Derived values ----------
+	/** OVERLOADED constructor: custom difficulty multiplier. */
+	public FloodEngine(double difficulty) {
+		this.difficulty = difficulty;
+		areas.add(new Area("RUBBLE LOT", "cam1.png"));
+		areas.add(new Area("GREEN HOUSE", "cam2.png"));
+		areas.add(new LowLyingArea("MAIN ROAD", "cam3.png"));
+		areas.add(new LowLyingArea("CREEK BANK", "cam4.png"));
+		areas.add(new Area("MARKET ALLEY", "cam5.png"));
+		areas.add(new HighGroundArea("BARANGAY GATE", "cam6.png"));
+
+		hazards.add(new BlackoutHazard(0.003));
+		hazards.add(new WindowHazard(0.006));
+		hazards.add(new PipeBurstHazard(0.006));
+	}
+
+	// ================= Read-only access for the UI =================
+	public int getAreaCount() {
+		return areas.size();
+	}
+
+	public Area getArea(int i) {
+		return areas.get(i);
+	}
+
+	public List<Area> getAreas() {
+		return Collections.unmodifiableList(areas);
+	}
+
+	public Area getCurrentArea() {
+		return areas.get(office.getCurrentCam());
+	}
+
+	public boolean isMonitorUp() {
+		return office.isMonitorUp();
+	}
+
+	public int getCurrentCam() {
+		return office.getCurrentCam();
+	}
+
+	public double getPower() {
+		return office.getPower();
+	}
+
+	public boolean isBlackout() {
+		return office.isBlackout();
+	}
+
+	public boolean isWindowBroken() {
+		return office.isWindowBroken();
+	}
+
+	public Office.Task getTask() {
+		return office.getTask();
+	}
+
+	public double getTaskTimeLeft() {
+		return office.getTaskTime();
+	}
+
+	public boolean isBusy() {
+		return office.isBusy();
+	}
+
+	public int getUsage() {
+		return office.getUsage(countWalls());
+	}
+
+	public boolean isWon() {
+		return won;
+	}
+
+	public boolean isLost() {
+		return lost;
+	}
+
+	public boolean isOver() {
+		return won || lost;
+	}
+
+	public String getAlert() {
+		return alert;
+	}
+
+	public boolean hasAlert() {
+		return alertTime > 0;
+	}
+
 	public double getWaterLevel() {
 		double sum = 0;
-		for (Area a : areas) sum += a.level;
-		return sum / areas.length;
+		for (Area a : areas) sum += a.getLevel();
+		return sum / areas.size();
 	}
 
 	public int countFlooded() {
 		int n = 0;
-		for (Area a : areas) if (a.flooded) n++;
+		for (Area a : areas) if (a.isFlooded()) n++;
 		return n;
 	}
 
 	public int countWalls() {
 		int n = 0;
-		for (Area a : areas) if (a.wallUp()) n++;
+		for (Area a : areas) if (a.hasWall()) n++;
 		return n;
 	}
 
@@ -69,16 +151,35 @@ public class FloodEngine {
 		return (h == 0 ? 12 : h) + " AM";
 	}
 
-	public boolean isOver() {
-		return won || lost;
+	// ================= Hooks used by Hazard subclasses =================
+	public void causeBlackout() {
+		office.setBlackout(true);
+		office.setMonitorUp(false);
+		for (Area a : areas) a.dropWall();
 	}
 
+	public void setWindowBroken(boolean broken) {
+		office.setWindowBroken(broken);
+	}
+
+	/** OVERLOADED: show an alert for the default 4 seconds. */
 	private void raise(String msg) {
-		alert = msg;
-		alertTime = 4;
+		raise(msg, 4);
 	}
 
-	// ---------- Main loop (the old Foxy.tick() etc.) ----------
+	/** OVERLOADED: show an alert for a custom time. */
+	private void raise(String msg, double seconds) {
+		alert = msg;
+		alertTime = seconds;
+	}
+
+	// ================= Game loop =================
+	/** OVERLOADED: advance one default step (0.1 s). */
+	public void tick() {
+		tick(DEFAULT_TICK);
+	}
+
+	/** OVERLOADED: advance by dt seconds. */
 	public void tick(double dt) {
 		if (isOver()) return;
 		elapsed += dt;
@@ -87,146 +188,132 @@ public class FloodEngine {
 			won = true;
 			return;
 		}
-
-		updateBusy(dt);
+		updateTask(dt);
 		updateFlood(dt);
 		updatePower(dt);
-		rollRandomEvents(dt);
+		rollHazards(dt);
 
 		if (getWaterLevel() >= 99.99) {
-			lost = true;
-			office.monitorUp = false;
+			lost = true; // alligator jumpscare
+			office.setMonitorUp(false);
+		}
+	}
+
+	private void updateTask(double dt) {
+		switch (office.updateTask(dt)) {
+		case PATCH:
+			office.setWindowBroken(false);
+			break;
+		case FIX:
+			getCurrentArea().setPipeBurst(false);
+			break;
+		case REBOOT:
+			office.setBlackout(false);
+			office.addPower(Office.REBOOT_GAIN);
+			break;
+		default:
+			break;
 		}
 	}
 
 	private void updateFlood(double dt) {
 		double base = (BASE_RATE + RATE_PER_HOUR * getHour()) * difficulty;
-		base *= 1 + 0.15 * countFlooded(); // flooded areas make the rest rise faster
-		if (office.windowBroken) base *= 1.5;
-		if (office.busyAction == Office.REBOOT) base *= 2; // flooding while rebooting
+		base *= 1 + 0.15 * countFlooded(); // flooded areas speed up the rest
+		if (office.isWindowBroken()) base *= 1.5;
+		if (office.getTask() == Office.Task.REBOOT) base *= 2;
 
 		for (Area a : areas) {
-			if (a.flooded) continue;
-			if (a.wallUp()) {
-				a.wallTimeLeft -= dt;
-				continue; // flood is held back
+			if (a.isFlooded()) continue;
+			if (a.hasWall()) {
+				a.tickWall(dt); // wall holds the water back
+				continue;
 			}
-			double rate = base * a.weight * (0.7 + rng.nextDouble() * 0.6);
-			if (a.pipeBurst) rate *= 3;
-			a.level += rate * dt;
-			if (a.level >= 100) {
-				a.level = 100;
-				a.flooded = true;
-				a.pipeBurst = false;
-				raise(a.name + " HAS FLOODED - CAMERA LOST");
+			double rate = base * (0.7 + rng.nextDouble() * 0.6);
+			double pipe = a.isPipeBurst() ? 3 : 1;
+			// polymorphism: addWater applies this area's own terrain multiplier
+			if (a.addWater(rate * dt, pipe)) {
+				raise(a.getName() + " HAS FLOODED - CAMERA LOST");
 			}
 		}
 	}
 
 	private void updatePower(double dt) {
-		if (office.blackout) return;
-		if (office.busyAction == Office.REBOOT) return; // everything is off while rebooting
-		office.power -= office.drainPerSecond(countWalls()) * dt;
-		if (office.power <= 0) {
-			office.power = 0;
-			startBlackout("POWER DEPLETED - REBOOT REQUIRED");
+		if (office.isBlackout() || office.getTask() == Office.Task.REBOOT) return;
+		office.addPower(-office.getDrainPerSecond(countWalls()) * dt);
+		if (office.isPowerEmpty()) {
+			causeBlackout();
+			raise("POWER DEPLETED - REBOOT REQUIRED");
 		}
 	}
 
-	private void startBlackout(String msg) {
-		office.blackout = true;
-		office.monitorUp = false;
-		for (Area a : areas) a.wallTimeLeft = 0;
-		raise(msg);
-	}
-
-	private void rollRandomEvents(double dt) {
-		if (!office.blackout && rng.nextDouble() < CHANCE_BLACKOUT * dt) {
-			startBlackout("STORM KNOCKED OUT THE POWER - REBOOT REQUIRED");
-		}
-		if (!office.windowBroken && rng.nextDouble() < CHANCE_WINDOW * dt) {
-			office.windowBroken = true;
-			raise("WINDOW SHATTERED - PATCH IT");
-		}
-		if (rng.nextDouble() < CHANCE_PIPE * dt) {
-			Area a = areas[rng.nextInt(areas.length)];
-			if (!a.flooded && !a.pipeBurst) {
-				a.pipeBurst = true;
-				raise("PIPE BURST AT " + a.name);
+	private void rollHazards(double dt) {
+		for (Hazard h : hazards) { // polymorphism: each Hazard acts differently
+			if (rng.nextDouble() < h.getChancePerSecond() * dt && h.canTrigger(this)) {
+				raise(h.trigger(this, rng));
 			}
 		}
 	}
 
-	private void updateBusy(double dt) {
-		if (!office.isBusy()) return;
-		office.busyTime -= dt;
-		if (office.busyTime > 0) return;
-		switch (office.busyAction) {
-		case Office.PATCH:
-			office.windowBroken = false;
-			break;
-		case Office.FIX:
-			areas[office.currentCam].pipeBurst = false;
-			break;
-		case Office.REBOOT:
-			office.blackout = false;
-			office.power = Math.min(100, office.power + Office.REBOOT_GAIN);
-			break;
-		}
-		office.busyAction = Office.NONE;
-		office.busyTime = 0;
-	}
-
-	// ---------- Player actions (each returns true if it worked) ----------
+	// ================= Player actions =================
 	private boolean canAct() {
 		return !isOver() && !office.isBusy();
 	}
 
 	public boolean toggleMonitor() {
-		if (!canAct() || office.blackout) return false;
-		office.monitorUp = !office.monitorUp;
+		if (!canAct() || office.isBlackout()) return false;
+		office.setMonitorUp(!office.isMonitorUp());
 		return true;
 	}
 
+	/** OVERLOADED: select a camera by index. */
 	public boolean selectCam(int i) {
-		if (!canAct() || !office.monitorUp || i < 0 || i >= areas.length) return false;
-		office.currentCam = i;
+		if (!canAct() || !office.isMonitorUp() || i < 0 || i >= areas.size()) return false;
+		office.setCurrentCam(i);
 		return true;
 	}
 
-	/** Deploy a flood wall in the camera currently being viewed. */
+	/** OVERLOADED: select a camera by area name, e.g. selectCam("creek bank"). */
+	public boolean selectCam(String areaName) {
+		for (int i = 0; i < areas.size(); i++) {
+			if (areas.get(i).getName().equalsIgnoreCase(areaName)) return selectCam(i);
+		}
+		return false;
+	}
+
+	/** OVERLOADED: deploy a wall on the camera currently being viewed. */
 	public boolean deployWall() {
-		if (!canAct() || office.blackout || !office.monitorUp) return false;
-		Area a = areas[office.currentCam];
-		if (a.flooded || a.wallUp()) return false;
-		a.wallTimeLeft = WALL_DURATION;
-		office.power = Math.max(0, office.power - Office.WALL_COST);
+		return deployWall(office.getCurrentCam());
+	}
+
+	/** OVERLOADED: deploy a wall on a specific camera. */
+	public boolean deployWall(int cam) {
+		if (!canAct() || office.isBlackout() || !office.isMonitorUp()) return false;
+		if (cam < 0 || cam >= areas.size()) return false;
+		if (!areas.get(cam).raiseWall()) return false;
+		office.addPower(-Office.WALL_COST);
 		return true;
 	}
 
-	/** Patch the broken window with wood (done from the booth, monitor down). */
+	/** Patch the window with wood (booth view only). */
 	public boolean patchWindow() {
-		if (!canAct() || !office.windowBroken || office.monitorUp) return false;
-		office.busyAction = Office.PATCH;
-		office.busyTime = PATCH_TIME;
+		if (!canAct() || !office.isWindowBroken() || office.isMonitorUp()) return false;
+		office.startTask(Office.Task.PATCH, PATCH_TIME);
 		return true;
 	}
 
-	/** Fix the burst pipe in the area currently on camera. Locks you on that camera. */
+	/** Fix the burst pipe in the area on camera; locks you on that camera. */
 	public boolean fixPipe() {
-		if (!canAct() || office.blackout || !office.monitorUp) return false;
-		if (!areas[office.currentCam].pipeBurst) return false;
-		office.busyAction = Office.FIX;
-		office.busyTime = FIX_TIME;
+		if (!canAct() || office.isBlackout() || !office.isMonitorUp()) return false;
+		if (!getCurrentArea().isPipeBurst()) return false;
+		office.startTask(Office.Task.FIX, FIX_TIME);
 		return true;
 	}
 
-	/** Reboot the generator: restores power but floods faster while it runs. */
+	/** Reboot the generator: restores power, but flooding doubles while it runs. */
 	public boolean reboot() {
 		if (!canAct()) return false;
-		office.monitorUp = false;
-		office.busyAction = Office.REBOOT;
-		office.busyTime = REBOOT_TIME;
+		office.setMonitorUp(false);
+		office.startTask(Office.Task.REBOOT, REBOOT_TIME);
 		return true;
 	}
 }
