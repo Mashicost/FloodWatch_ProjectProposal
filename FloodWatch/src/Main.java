@@ -61,7 +61,7 @@ public class Main extends JPanel {
 		setPreferredSize(new Dimension(W, H));
 		setLayout(null);
 
-		officeImg = loadImage("office.png");
+		officeImg = loadImage("office.jpg");
 		mapFallback = loadImage("map.jpg");
 		jumpscare = loadImage("jump.jpg");
 		camImages = new BufferedImage[game.getAreaCount()];
