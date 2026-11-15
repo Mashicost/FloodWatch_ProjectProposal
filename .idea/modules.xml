@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/Contained/Contained.iml" filepath="$PROJECT_DIR$/Contained/Contained.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/FloodWatch_ProjectProposal.iml" filepath="$PROJECT_DIR$/.idea/FloodWatch_ProjectProposal.iml" />
+    </modules>
+  </component>
+</project>
