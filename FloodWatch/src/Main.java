@@ -2,95 +2,114 @@ import java.awt.*;
 import java.awt.event.*;
 import java.awt.geom.Rectangle2D;
 import java.awt.image.BufferedImage;
-import java.util.Random;
+import java.util.ArrayList;
+import java.util.List;
 import javax.imageio.ImageIO;
 import javax.swing.*;
 
 /**
  * FNAF-style UI.
  *  - Office: wide image that pans when the mouse is near the left/right edge.
- *            Pan fully right to reach the reboot panel and click it.
- *  - Cameras: hover the bar at the bottom of the screen to flip the monitor up/down.
- *            Click a camera on the map to switch to it.
+ *            Pan fully right and the power panel's cover lifts open; click REBOOT.
+ *  - Cameras: hover the bar at the bottom of the screen to flip the monitor up/down (animated).
+ *            Click a camera on the map to switch to it (its cone lights up).
+ *  - F11 toggles full screen, ESC leaves it.
+ *
+ * Everything is drawn on a fixed LOGICAL canvas (W x H) scaled to the window (letterboxed).
  * Talks to FloodEngine only through its public getters/actions (encapsulation).
  */
 public class Main extends JPanel {
 	private static final long serialVersionUID = 1L;
-	private static final int W = 1107, H = 614;
-	private static final Font MONO = new Font(Font.MONOSPACED, Font.BOLD, 22);
-	private static final Font SMALL = new Font(Font.MONOSPACED, Font.BOLD, 16);
-	private static final Font BIG = new Font(Font.MONOSPACED, Font.BOLD, 56);
+	private static final boolean START_FULLSCREEN = false;
+
+	// ---- Logical canvas ----
+	private static final int W = 1280, H = 720;
+	private static final int FRAME_INSET = 26; // white camera frame
+	private static final int RIGHT_EDGE = W - 52; // right-aligned HUD text
 
 	// ---- Office panning ----
-	private static final double OFFICE_ZOOM = 1.5; // 1.0 = no panning; use wider art and lower this
-	private static final double PAN_SPEED = 700; // pixels per second at the very edge
-	private static final double EDGE = 0.25; // outer 25% of the screen scrolls
+	private static final double OFFICE_MIN_WIDTH = 1.25; // zoom just enough to allow panning
+	private static final double OFFICE_V_ANCHOR = 0.6;
+	private static final int PANEL_ROOM = 340; // extra dark wall to the right of the art that holds the power panel
+	private static final double PAN_SPEED = 800;
+	private static final double EDGE = 0.25;
+
+	// ---- Animations (seconds) ----
+	private static final double FLIP_TIME = 0.32;
+	private static final double PANEL_TIME = 0.45;
+	private static final double PANEL_OPEN_ZONE = 80; // px from the right end that opens the panel
 
 	// ---- Monitor flip ----
 	private static final double FLIP_COOLDOWN = 0.6;
-	private final Rectangle flipRect = new Rectangle(W / 2 - 180, H - 44, 360, 44);
+	private final Rectangle flipRect = new Rectangle(W / 2 - 290, H - 62, 580, 48);
 
-	// ---- Camera map (hotspot centres in map.png pixel coordinates, 362x464) ----
-	private static final int MAP_IMG_W = 362, MAP_IMG_H = 464, MAP_DRAW_H = 270, SPOT_R = 26;
+	// ---- Camera map (hotspot centres in map image pixel coordinates, 362x464) ----
+	private static final int MAP_IMG_W = 362, MAP_IMG_H = 464, MAP_DRAW_H = 320, SPOT_R = 26;
 	private static final int[][] CAM_SPOTS = { { 140, 185 }, { 217, 185 }, { 40, 235 }, { 143, 275 }, { 217, 275 } };
 	private final double mapScale = MAP_DRAW_H / (double) MAP_IMG_H;
-	private final int mapX = W - (int) (MAP_IMG_W * mapScale) - 15;
-	private final int mapY = H - MAP_DRAW_H - 60;
+	private final int mapX = W - (int) (MAP_IMG_W * mapScale) - 40;
+	private final int mapY = H - MAP_DRAW_H - 80;
 
 	// ---- On-screen buttons ----
-	private final Rectangle wallRect = new Rectangle(20, H - 140, 190, 36);
-	private final Rectangle fixRect = new Rectangle(20, H - 96, 190, 36);
-	private final Rectangle patchRect = new Rectangle(20, H - 96, 220, 36);
+	private final Rectangle wallRect = new Rectangle(55, H - 150, 200, 38);
+	private final Rectangle fixRect = new Rectangle(265, H - 150, 170, 38);
+	private final Rectangle patchRect = new Rectangle(55, H - 150, 230, 38);
+	private final Rectangle restartRect = new Rectangle(W / 2 - 110, H / 2 + 80, 220, 44);
 
 	private FloodEngine game = new FloodEngine();
-	private final BufferedImage officeImg, mapFallback;
-	private final BufferedImage[] camImages, mapImages; // mapImages[i] = map with camera i lit (optional)
-	private final BufferedImage jumpscare;
-	private final Random rng = new Random();
-	private final JButton restartBtn = new JButton("Restart Night");
+	private final BufferedImage officeImg, mapFallback, jumpscare;
+	private final BufferedImage[] camImages, mapImages; // mapImages[i] = map with camera i lit
+	private final BufferedImage[] flipFrames; // optional pre-rendered monitor flip (flip0.png ...)
+	private final StaticOverlay staticOverlay = new StaticOverlay();
+	private final Animation flipAnim = new Animation(FLIP_TIME, Animation.Easing.EASE_IN_OUT);
+	private final Animation panelAnim = new Animation(PANEL_TIME, Animation.Easing.EASE_OUT);
+	private final BufferedImage flipBuf = new BufferedImage(W, H, BufferedImage.TYPE_INT_RGB);
 
 	private final double officeDrawW, officeDrawH;
 	private final double maxScroll;
 	private double scrollX;
-	private int mouseX = W / 2, mouseY = H / 2;
+	private int mouseX = W / 2, mouseY = H / 2; // logical coordinates
 	private boolean wasInFlip = false;
 	private double flipCooldown = 0;
+	private double clock = 0; // for blinking things
 	private long lastNanos = System.nanoTime();
+
+	// window -> logical canvas transform
+	private double viewScale = 1, viewOffX = 0, viewOffY = 0;
+	private static boolean fullscreen = false;
 
 	public Main() {
 		setPreferredSize(new Dimension(W, H));
 		setLayout(null);
+		setBackground(Color.BLACK);
+		UI.loadFont("font.ttf"); // optional custom pixel font
 
-		officeImg = loadImage("office.jpg");
-		mapFallback = loadImage("map.jpg");
-		jumpscare = loadImage("jump.jpg");
+		officeImg = loadAny("office", true);
+		mapFallback = loadAny("map", true);
+		jumpscare = loadAny("jump", false);
 		camImages = new BufferedImage[game.getAreaCount()];
 		mapImages = new BufferedImage[game.getAreaCount()];
 		for (int i = 0; i < camImages.length; i++) {
-			camImages[i] = loadImage(game.getArea(i).getImageFile());
-			mapImages[i] = loadQuiet("map" + (i + 1) + ".png"); // optional per-camera lit maps
+			camImages[i] = loadAny(stripExt(game.getArea(i).getImageFile()), true);
+			mapImages[i] = loadAny("map" + (i + 1), false);
 		}
+		flipFrames = loadSequence("flip");
+		BufferedImage[] staticFrames = loadSequence("static");
+		if (staticFrames.length > 0) staticOverlay.setFrames(staticFrames);
 
 		double iw = officeImg != null ? officeImg.getWidth() : 1920;
 		double ih = officeImg != null ? officeImg.getHeight() : 1080;
-		double scale = (H / ih) * OFFICE_ZOOM;
+		double scale = Math.max(H / ih, (W * OFFICE_MIN_WIDTH) / iw);
 		officeDrawW = iw * scale;
 		officeDrawH = ih * scale;
-		maxScroll = Math.max(0, officeDrawW - W);
+		maxScroll = Math.max(0, officeDrawW + PANEL_ROOM - W);
 		scrollX = maxScroll / 2;
-
-		restartBtn.setBounds(W / 2 - 80, H / 2 + 80, 160, 36);
-		restartBtn.setVisible(false);
-		restartBtn.addActionListener(e -> {
-			game = new FloodEngine();
-			scrollX = maxScroll / 2;
-		});
-		add(restartBtn);
 
 		addMouseMotionListener(new MouseMotionAdapter() {
 			public void mouseMoved(MouseEvent e) {
-				mouseX = e.getX();
-				mouseY = e.getY();
+				updateView();
+				mouseX = toLogicalX(e.getX());
+				mouseY = toLogicalY(e.getY());
 			}
 
 			public void mouseDragged(MouseEvent e) {
@@ -99,7 +118,8 @@ public class Main extends JPanel {
 		});
 		addMouseListener(new MouseAdapter() {
 			public void mousePressed(MouseEvent e) {
-				handleClick(e.getX(), e.getY());
+				updateView();
+				handleClick(toLogicalX(e.getX()), toLogicalY(e.getY()));
 			}
 		});
 		bindKeys();
@@ -108,38 +128,78 @@ public class Main extends JPanel {
 	}
 
 	// ================= Loading =================
-	private BufferedImage loadImage(String name) {
-		try {
-			java.io.InputStream in = ResourceLoader.load(name);
-
-			if (in == null) {
-				System.out.println("NOT FOUND: " + name);
-				return null;
+	/** Tries base.png, base.jpg, base.jpeg so you can mix formats freely. */
+	private BufferedImage loadAny(String base, boolean warn) {
+		String[] exts = { ".png", ".jpg", ".jpeg" };
+		for (String ext : exts) {
+			try {
+				java.io.InputStream in = ResourceLoader.load(base + ext);
+				if (in == null) continue;
+				BufferedImage img = ImageIO.read(in);
+				in.close();
+				if (img != null) return img;
+			} catch (Exception e) {
+				e.printStackTrace();
 			}
-
-			BufferedImage img = ImageIO.read(in);
-
-			System.out.println("File: " + name);
-			System.out.println("Image: " + img);
-
-			in.close();
-
-			return img;
-
-		} catch (Exception e) {
-			e.printStackTrace();
-			return null;
 		}
+		if (warn) System.out.println("NOT FOUND (.png/.jpg): " + base);
+		return null;
 	}
 
-	/** Same as loadImage but silent (for optional files). */
-	private BufferedImage loadQuiet(String name) {
-		try {
-			java.io.InputStream in = ResourceLoader.load(name);
-			return in == null ? null : ImageIO.read(in);
-		} catch (Exception e) {
-			return null;
+	/** Loads prefix0, prefix1, ... until one is missing. */
+	private BufferedImage[] loadSequence(String prefix) {
+		List<BufferedImage> list = new ArrayList<BufferedImage>();
+		for (int i = 0; i < 300; i++) {
+			BufferedImage f = loadAny(prefix + i, false);
+			if (f == null) break;
+			list.add(f);
 		}
+		if (!list.isEmpty()) System.out.println("Loaded " + list.size() + " '" + prefix + "' frames.");
+		return list.toArray(new BufferedImage[0]);
+	}
+
+	private String stripExt(String file) {
+		int dot = file.lastIndexOf('.');
+		return dot < 0 ? file : file.substring(0, dot);
+	}
+
+	// ================= View transform (full screen / resizing) =================
+	private void updateView() {
+		viewScale = Math.min(getWidth() / (double) W, getHeight() / (double) H);
+		if (viewScale <= 0) viewScale = 1;
+		viewOffX = (getWidth() - W * viewScale) / 2;
+		viewOffY = (getHeight() - H * viewScale) / 2;
+	}
+
+	private int toLogicalX(int sx) {
+		return (int) ((sx - viewOffX) / viewScale);
+	}
+
+	private int toLogicalY(int sy) {
+		return (int) ((sy - viewOffY) / viewScale);
+	}
+
+	private void toggleFullscreen() {
+		Window win = SwingUtilities.getWindowAncestor(this);
+		if (win instanceof JFrame) setFullscreen((JFrame) win, !fullscreen);
+	}
+
+	private static void setFullscreen(JFrame f, boolean on) {
+		GraphicsDevice dev = GraphicsEnvironment.getLocalGraphicsEnvironment().getDefaultScreenDevice();
+		f.dispose(); // must be hidden to change decorations
+		f.setUndecorated(on);
+		if (on) {
+			f.setResizable(false);
+			dev.setFullScreenWindow(f);
+		} else {
+			dev.setFullScreenWindow(null);
+			f.setResizable(true);
+			f.pack();
+			f.setLocationRelativeTo(null);
+			f.setVisible(true);
+		}
+		fullscreen = on;
+		f.requestFocus();
 	}
 
 	// ================= Game loop =================
@@ -147,13 +207,25 @@ public class Main extends JPanel {
 		long now = System.nanoTime();
 		double dt = Math.min(0.1, (now - lastNanos) / 1e9);
 		lastNanos = now;
+		clock += dt;
 
+		updateView();
 		game.tick(dt);
+		staticOverlay.update(dt);
+		updateAnimations(dt);
 		flipCooldown = Math.max(0, flipCooldown - dt);
 		updatePan(dt);
 		updateFlip();
-		restartBtn.setVisible(game.isOver());
 		repaint();
+	}
+
+	/** The engine decides the state; the animations just chase it smoothly. */
+	private void updateAnimations(double dt) {
+		flipAnim.setTarget(game.isMonitorUp());
+		flipAnim.update(dt);
+		boolean atPanel = !game.isMonitorUp() && scrollX >= maxScroll - PANEL_OPEN_ZONE;
+		panelAnim.setTarget(atPanel);
+		panelAnim.update(dt);
 	}
 
 	/** Mouse near the left/right edge scrolls the office. Faster the closer to the edge. */
@@ -168,18 +240,33 @@ public class Main extends JPanel {
 		scrollX = Math.max(0, Math.min(maxScroll, scrollX));
 	}
 
-	/** Moving the mouse onto the bottom bar flips the monitor (with a short cooldown). */
 	private void updateFlip() {
 		boolean inside = flipRect.contains(mouseX, mouseY);
-		if (inside && !wasInFlip && flipCooldown <= 0 && !game.isOver()) {
-			if (game.toggleMonitor()) flipCooldown = FLIP_COOLDOWN;
-		}
+		if (inside && !wasInFlip && flipCooldown <= 0 && !game.isOver()) flipMonitor();
 		wasInFlip = inside;
+	}
+
+	private void flipMonitor() {
+		if (game.toggleMonitor()) {
+			flipCooldown = FLIP_COOLDOWN;
+			if (game.isMonitorUp()) staticOverlay.pulse(0.25);
+		}
+	}
+
+	private void selectCam(int i) {
+		if (i != game.getCurrentCam() && game.selectCam(i)) staticOverlay.pulse(0.3);
+	}
+
+	private void restart() {
+		game = new FloodEngine();
+		scrollX = maxScroll / 2;
+		flipAnim.setTarget(false, true);
+		panelAnim.setTarget(false, true);
 	}
 
 	// ================= Input =================
 	private Rectangle2D.Double panelRect() { // reboot panel in office WORLD coordinates
-		return new Rectangle2D.Double(officeDrawW - 330, 235, 260, 295);
+		return new Rectangle2D.Double(officeDrawW + 40, 250, 260, 300);
 	}
 
 	private int hitCamSpot(int x, int y) {
@@ -192,29 +279,39 @@ public class Main extends JPanel {
 	}
 
 	private void handleClick(int x, int y) {
-		if (game.isOver()) return;
-		if (game.isMonitorUp()) {
+		if (game.isOver()) {
+			if (restartRect.contains(x, y)) restart();
+			return;
+		}
+		if (game.isMonitorUp() && flipAnim.isOpen()) {
 			if (wallRect.contains(x, y)) game.deployWall();
 			else if (fixRect.contains(x, y)) game.fixPipe();
 			else {
 				int cam = hitCamSpot(x, y);
-				if (cam >= 0) game.selectCam(cam);
+				if (cam >= 0) selectCam(cam);
 			}
-		} else {
+		} else if (!game.isMonitorUp() && flipAnim.isClosed()) {
 			if (game.isWindowBroken() && patchRect.contains(x, y)) game.patchWindow();
-			else if (panelRect().contains(x + scrollX, y)) game.reboot();
+			else if (panelAnim.isOpen() && panelRect().contains(x + scrollX, y)) game.reboot();
 		}
 	}
 
 	private void bindKeys() { // keyboard shortcuts, handy for testing
-		bindKey("SPACE", () -> game.toggleMonitor());
+		bindKey("SPACE", () -> flipMonitor());
 		bindKey("W", () -> game.deployWall());
 		bindKey("F", () -> game.fixPipe());
 		bindKey("P", () -> game.patchWindow());
 		bindKey("R", () -> game.reboot());
-		for (int i = 0; i < 5; i++) {
+		bindKey("ENTER", () -> {
+			if (game.isOver()) restart();
+		});
+		bindKey("F11", () -> toggleFullscreen());
+		bindKey("ESCAPE", () -> {
+			if (fullscreen) toggleFullscreen();
+		});
+		for (int i = 0; i < CAM_SPOTS.length; i++) {
 			final int idx = i;
-			bindKey(String.valueOf(i + 1), () -> game.selectCam(idx));
+			bindKey(String.valueOf(i + 1), () -> selectCam(idx));
 		}
 	}
 
@@ -230,106 +327,189 @@ public class Main extends JPanel {
 	}
 
 	// ================= Drawing =================
+	private void quality(Graphics2D g) {
+		g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+		g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+		g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+	}
+
 	@Override
 	protected void paintComponent(Graphics g0) {
 		Graphics2D g = (Graphics2D) g0;
-		g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+		updateView();
 		g.setColor(Color.BLACK);
-		g.fillRect(0, 0, getWidth(), getHeight());
+		g.fillRect(0, 0, getWidth(), getHeight()); // letterbox bars
+
+		g.translate(viewOffX, viewOffY);
+		g.scale(viewScale, viewScale);
+		g.clipRect(0, 0, W, H);
+		quality(g);
 
 		if (game.isLost()) {
 			drawJumpscare(g);
+			UI.box(g, restartRect, "RESTART NIGHT");
 			return;
 		}
 		if (game.isWon()) {
-			g.setColor(Color.WHITE);
-			g.setFont(BIG);
-			center(g, "6 AM", H / 2 - 20);
-			g.setFont(MONO);
-			center(g, "You kept the barangay dry. Night survived!", H / 2 + 30);
+			UI.textCenter(g, "6 AM", W / 2, H / 2 - 20, 80, Color.WHITE);
+			UI.textCenter(g, "You kept the barangay dry. Night survived!", W / 2, H / 2 + 30, 24, Color.WHITE);
+			UI.box(g, restartRect, "RESTART NIGHT");
 			return;
 		}
-		if (game.isMonitorUp()) drawCamera(g);
-		else drawOffice(g);
+
+		double p = flipAnim.getProgress();
+		if (p <= 0) {
+			drawOffice(g);
+		} else if (p >= 1) {
+			drawCameraScreen(g);
+		} else if (flipFrames.length > 0) {
+			// pre-rendered flip animation: pick the frame that matches the progress
+			int idx = Math.min(flipFrames.length - 1, (int) (p * flipFrames.length));
+			g.drawImage(flipFrames[idx], 0, 0, W, H, null);
+		} else {
+			drawOffice(g);
+			drawFlipping(g, p);
+		}
 		drawHud(g);
-		drawFlipBar(g);
+		UI.flipBar(g, flipRect, flipRect.contains(mouseX, mouseY));
+	}
+
+	/**
+	 * Procedural monitor flip: the camera screen is rendered to an off-screen image, then drawn as a
+	 * trapezoid that rises from the bottom edge. The top edge is narrower while the screen is tilted
+	 * back, which gives a cheap perspective effect.
+	 */
+	private void drawFlipping(Graphics2D g, double p) {
+		g.setColor(new Color(0, 0, 0, (int) (150 * p))); // office dims as the monitor rises
+		g.fillRect(0, 0, W, H);
+
+		Graphics2D bg = flipBuf.createGraphics();
+		quality(bg);
+		drawCameraScreen(bg);
+		bg.dispose();
+
+		double h = H * p; // projected height of the screen
+		double topScale = 0.55 + 0.45 * p; // width of the top edge relative to the bottom
+		int strip = 4;
+		for (int sy = 0; sy < H; sy += strip) {
+			double t0 = sy / (double) H, t1 = Math.min(H, sy + strip) / (double) H;
+			int dy0 = (int) Math.round(H - h * (1 - t0));
+			int dy1 = (int) Math.round(H - h * (1 - t1));
+			if (dy1 <= dy0) continue;
+			int dw = (int) (W * (topScale + (1 - topScale) * t0));
+			int dx = (W - dw) / 2;
+			g.drawImage(flipBuf, dx, dy0, dx + dw, dy1, 0, sy, W, Math.min(H, sy + strip), null);
+		}
 	}
 
 	// ---------- Office (pannable) ----------
 	private void drawOffice(Graphics2D g) {
 		int x0 = (int) -scrollX;
-		int y0 = (int) ((H - officeDrawH) / 2);
+		int y0 = (int) (-(officeDrawH - H) * OFFICE_V_ANCHOR);
 		if (officeImg != null) {
 			g.drawImage(officeImg, x0, y0, (int) officeDrawW, (int) officeDrawH, null);
 		} else {
 			g.setPaint(new GradientPaint(0, 0, new Color(15, 20, 28), 0, H, new Color(35, 40, 50)));
 			g.fillRect(0, 0, W, H);
 		}
+		// dark alcove to the right of the art, where the power panel lives
+		int edge = x0 + (int) officeDrawW;
+		g.setPaint(new GradientPaint(edge - 90, 0, new Color(30, 32, 36, 0), edge, 0, new Color(30, 32, 36)));
+		g.fillRect(edge - 90, 0, 90, H);
+		g.setPaint(new GradientPaint(edge, 0, new Color(30, 32, 36), edge + PANEL_ROOM, 0, new Color(12, 13, 16)));
+		g.fillRect(edge, 0, PANEL_ROOM + 2, H);
+
 		int waterH = (int) (H * 0.7 * game.getWaterLevel() / 100.0);
 		g.setColor(new Color(40, 110, 200, 130));
 		g.fillRect(0, H - waterH, W, waterH);
 
+		UI.vignette(g, W, H, 170);
 		if (game.isBlackout()) {
 			g.setColor(new Color(0, 0, 0, 215));
 			g.fillRect(0, 0, W, H);
 		}
 		drawRebootPanel(g, x0);
 
-		g.setFont(MONO);
 		if (game.isWindowBroken()) {
-			g.setColor(Color.RED);
-			g.drawString("WINDOW SHATTERED - rain is blowing in", 55, 125);
-			drawButton(g, patchRect, "PATCH WINDOW (P)", !game.isBusy());
+			UI.textCenter(g, "WINDOW SHATTERED - rain is blowing in", W / 2, 185, 22, new Color(255, 70, 70));
+			UI.box(g, patchRect, "PATCH WINDOW (P)", !game.isBusy());
 		}
 		if (game.isBlackout()) {
-			g.setColor(Color.RED);
-			center(g, "BLACKOUT - PAN RIGHT TO THE POWER PANEL", 60);
+			UI.textCenter(g, "BLACKOUT - PAN RIGHT TO THE POWER PANEL", W / 2, 225, 24, new Color(255, 70, 70));
 		}
-		g.setColor(Color.ORANGE);
-		if (game.getTask() == Office.Task.REBOOT) {
-			center(g, "REBOOTING... " + (int) Math.ceil(game.getTaskTimeLeft()) + "s (flood rising faster!)", H / 2);
-		} else if (game.getTask() == Office.Task.PATCH) {
-			center(g, "PATCHING WINDOW... " + (int) Math.ceil(game.getTaskTimeLeft()) + "s", H / 2);
+		if (game.getTask() == Office.Task.PATCH) {
+			UI.textCenter(g, "PATCHING WINDOW... " + (int) Math.ceil(game.getTaskTimeLeft()) + "s", W / 2, H / 2, 26, Color.ORANGE);
 		}
 		// edge arrows show which way you can pan
-		g.setColor(new Color(255, 255, 255, 120));
-		g.setFont(BIG);
-		if (scrollX > 1) g.drawString("\u25C0", 10, H / 2);
-		if (scrollX < maxScroll - 1) g.drawString("\u25B6", W - 60, H / 2);
+		Color arrow = new Color(255, 255, 255, 120);
+		if (scrollX > 1) UI.text(g, "\u25C0", 14, H / 2, 56, arrow);
+		if (scrollX < maxScroll - 1) UI.text(g, "\u25B6", W - 70, H / 2, 56, arrow);
 	}
 
+	/** The power panel: a metal cover lifts away (panelAnim) when you pan to it. */
 	private void drawRebootPanel(Graphics2D g, int x0) {
-		Rectangle2D.Double p = panelRect();
-		int px = (int) (p.x + x0), py = (int) p.y, pw = (int) p.width, ph = (int) p.height;
+		Rectangle2D.Double pr = panelRect();
+		int px = (int) (pr.x + x0), py = (int) pr.y, pw = (int) pr.width, ph = (int) pr.height;
 		if (px > W || px + pw < 0) return; // off-screen
+		double p = panelAnim.getProgress();
 		boolean needed = game.isBlackout();
-		g.setColor(new Color(20, 22, 26));
+		boolean rebooting = game.getTask() == Office.Task.REBOOT;
+
+		g.setColor(new Color(18, 20, 24));
 		g.fillRect(px, py, pw, ph);
-		g.setColor(needed ? Color.RED : new Color(150, 150, 150));
+
+		if (p > 0.15) { // contents fade in as the cover lifts
+			Composite old = g.getComposite();
+			float a = (float) Math.min(1, (p - 0.15) / 0.5);
+			g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, a));
+			UI.text(g, "POWER PANEL", px + 28, py + 40, 24, Color.WHITE);
+			UI.text(g, "Power left: " + (int) Math.ceil(game.getPower()) + "%", px + 28, py + 70, 17, Color.WHITE);
+
+			Rectangle btn = new Rectangle(px + 28, py + 90, pw - 56, 80);
+			boolean ok = !game.isBusy();
+			g.setColor(rebooting ? new Color(90, 70, 20) : needed ? new Color(185, 30, 30) : new Color(50, 90, 50));
+			if (!ok && !rebooting) g.setColor(Color.DARK_GRAY);
+			g.fillRect(btn.x, btn.y, btn.width, btn.height);
+			g.setColor(Color.WHITE);
+			g.drawRect(btn.x, btn.y, btn.width, btn.height);
+			UI.textCenter(g, rebooting ? "REBOOTING" : "REBOOT", btn.x + btn.width / 2, btn.y + 50, 24, Color.WHITE);
+
+			// segmented progress bar (FNAF 3 style)
+			double frac = rebooting ? 1 - game.getTaskTimeLeft() / FloodEngine.REBOOT_TIME : 0;
+			int segs = 10, sw = (pw - 56) / segs;
+			for (int s = 0; s < segs; s++) {
+				g.setColor(s < Math.round(frac * segs) ? new Color(235, 205, 20) : new Color(50, 50, 50));
+				g.fillRect(px + 28 + s * sw, py + 188, sw - 3, 20);
+			}
+			UI.text(g, "+25% power", px + 28, py + 242, 16, Color.WHITE);
+			UI.text(g, "flood rises faster", px + 28, py + 264, 16, Color.WHITE);
+			UI.text(g, "while rebooting", px + 28, py + 284, 16, Color.WHITE);
+			g.setComposite(old);
+		}
+
+		// the cover plate
+		int coverH = (int) Math.ceil(ph * (1 - p));
+		if (coverH > 0) {
+			g.setPaint(new GradientPaint(0, py, new Color(95, 98, 105), 0, py + ph, new Color(55, 58, 64)));
+			g.fillRect(px, py, pw, coverH);
+			g.setColor(new Color(20, 20, 20));
+			g.fillRect(px, py + coverH - 5, pw, 5); // lower lip
+			if (coverH > 70) {
+				g.setColor(new Color(30, 30, 30));
+				for (int i = 0; i < 4; i++) g.fillOval(px + (i % 2 == 0 ? 10 : pw - 22), py + 10 + (i / 2) * (coverH - 40), 12, 12);
+				UI.textCenter(g, "MAINTENANCE", px + pw / 2, py + coverH / 2 + 6, 20, new Color(235, 205, 20));
+			}
+		}
+
+		boolean blink = needed && ((int) (clock * 3) % 2 == 0);
+		g.setColor(blink || (needed && p > 0.9) ? Color.RED : new Color(150, 150, 150));
 		g.setStroke(new BasicStroke(4));
 		g.drawRect(px, py, pw, ph);
 		g.setStroke(new BasicStroke(1));
-		g.setFont(MONO);
-		g.setColor(Color.WHITE);
-		g.drawString("POWER PANEL", px + 30, py + 40);
-		g.setFont(SMALL);
-		g.drawString("Power: " + (int) Math.ceil(game.getPower()) + "%", px + 30, py + 75);
-		// big reboot button
-		boolean ok = !game.isBusy();
-		g.setColor(needed ? new Color(190, 30, 30) : new Color(60, 90, 60));
-		if (!ok) g.setColor(Color.DARK_GRAY);
-		g.fillRect(px + 30, py + 110, pw - 60, 90);
-		g.setColor(Color.WHITE);
-		g.setFont(MONO);
-		g.drawString("REBOOT", px + 70, py + 165);
-		g.setFont(SMALL);
-		g.drawString("+25% power", px + 55, py + 235);
-		g.drawString("flood rises faster", px + 40, py + 260);
-		g.drawString("while rebooting", px + 50, py + 280);
 	}
 
 	// ---------- Cameras ----------
-	private void drawCamera(Graphics2D g) {
+	private void drawCameraScreen(Graphics2D g) {
 		Area a = game.getCurrentArea();
 		BufferedImage img = camImages[game.getCurrentCam()];
 		boolean dead = a.isFlooded() || game.isBlackout();
@@ -345,43 +525,48 @@ public class Main extends JPanel {
 
 		if (a.hasWall()) {
 			g.setColor(new Color(170, 170, 170, 230));
-			g.fillRect(0, H - 220, W, 24);
-			g.setColor(Color.BLACK);
-			g.setFont(SMALL);
-			g.drawString("FLOOD WALL  " + (int) a.getWallTimeLeft() + "s", 20, H - 202);
+			g.fillRect(0, H - 250, W, 24);
+			UI.text(g, "FLOOD WALL  " + (int) a.getWallTimeLeft() + "s", 55, H - 232, 16, Color.BLACK);
 		}
-		g.setFont(MONO);
+
+		// Security-camera static: light grain on a live feed, solid static on a dead one.
+		if (dead) staticOverlay.draw(g, W, H, 1.0f);
+		else staticOverlay.draw(g, W, H);
+
 		if (dead) {
-			drawStatic(g, a.isFlooded() ? "CAMERA LOST - AREA FLOODED" : "NO POWER");
+			UI.textCenter(g, a.isFlooded() ? "CAMERA LOST - AREA FLOODED" : "NO POWER", W / 2, H / 2, 30, Color.WHITE);
 		} else if (game.getTask() == Office.Task.FIX) {
-			g.setColor(Color.ORANGE);
-			center(g, "REPAIRING PIPE... " + (int) Math.ceil(game.getTaskTimeLeft()) + "s", H / 2);
+			UI.textCenter(g, "REPAIRING PIPE... " + (int) Math.ceil(game.getTaskTimeLeft()) + "s", W / 2, H / 2, 28, Color.ORANGE);
 		} else if (a.isPipeBurst()) {
-			g.setColor(Color.RED);
-			center(g, "PIPE BURST - FIX IT", H / 2);
+			UI.textCenter(g, "PIPE BURST - FIX IT", W / 2, H / 2, 28, new Color(255, 60, 60));
 		}
-		g.setColor(new Color(255, 255, 255, 220));
-		g.setFont(MONO);
-		g.drawString("SECURITY FEED", 55, 85);
-		g.drawString("PLAY \u25B6", 55, 120);
-		g.drawString("CAM " + (game.getCurrentCam() + 1) + " - " + a.getName(), 55, 160);
-		g.drawString(a.getTerrainLabel(), 55, 190);
-		g.drawString("FLOOD " + (int) a.getLevel() + "%", 55, H - 230);
+
+		UI.frameBorder(g, W, H, FRAME_INSET);
+		if ((int) (clock * 1.5) % 2 == 0) { // blinking red REC dot
+			g.setColor(new Color(220, 20, 20));
+			g.fillOval(410, 52, 24, 24);
+		}
+
+		// area name above the map, like "Show Stage" in FNAF 1
+		UI.textRight(g, a.getName(), RIGHT_EDGE, mapY - 44, 34, Color.WHITE);
+		UI.textRight(g, "FLOOD " + (int) a.getLevel() + "%  -  " + a.getTerrainLabel(), RIGHT_EDGE, mapY - 14, 18,
+				new Color(150, 200, 255));
 
 		boolean act = !game.isBusy() && !game.isBlackout();
-		drawButton(g, wallRect, "FLOOD WALL (W)", act && !a.isFlooded() && !a.hasWall());
-		drawButton(g, fixRect, "FIX PIPE (F)", act && a.isPipeBurst());
+		UI.box(g, wallRect, "FLOOD WALL (W)", act && !a.isFlooded() && !a.hasWall());
+		UI.box(g, fixRect, "FIX PIPE (F)", act && a.isPipeBurst());
 		drawMap(g);
 	}
 
 	private void drawMap(Graphics2D g) {
 		int cur = game.getCurrentCam();
-		BufferedImage m = mapImages[cur] != null ? mapImages[cur] : mapFallback;
+		boolean hasLit = mapImages[cur] != null;
+		BufferedImage m = hasLit ? mapImages[cur] : mapFallback;
 		int mw = (int) (MAP_IMG_W * mapScale), mh = MAP_DRAW_H;
 		g.setColor(new Color(0, 0, 0, 150));
 		g.fillRect(mapX - 6, mapY - 6, mw + 12, mh + 12);
 		if (m != null) g.drawImage(m, mapX, mapY, mw, mh, null);
-		if (mapImages[cur] == null) { // no per-camera lit map yet: ring the active camera
+		if (!hasLit && cur < CAM_SPOTS.length) { // no per-camera lit map yet: ring the active camera
 			double cx = mapX + CAM_SPOTS[cur][0] * mapScale;
 			double cy = mapY + CAM_SPOTS[cur][1] * mapScale;
 			g.setColor(Color.WHITE);
@@ -392,70 +577,37 @@ public class Main extends JPanel {
 		}
 	}
 
-	// ---------- Shared bits ----------
-	private void drawButton(Graphics2D g, Rectangle r, String text, boolean enabled) {
-		g.setColor(enabled ? new Color(30, 70, 110, 220) : new Color(50, 50, 50, 180));
-		g.fillRect(r.x, r.y, r.width, r.height);
-		g.setColor(enabled ? Color.WHITE : Color.GRAY);
-		g.drawRect(r.x, r.y, r.width, r.height);
-		g.setFont(SMALL);
-		g.drawString(text, r.x + 12, r.y + 24);
-	}
-
-	private void drawFlipBar(Graphics2D g) {
-		boolean hot = flipRect.contains(mouseX, mouseY);
-		g.setColor(new Color(255, 255, 255, hot ? 90 : 45));
-		g.fillRoundRect(flipRect.x, flipRect.y + 6, flipRect.width, flipRect.height, 20, 20);
-		g.setColor(new Color(255, 255, 255, 200));
-		g.setFont(SMALL);
-		center(g, game.isMonitorUp() ? "\u25B2  CLOSE CAMERAS  \u25B2" : "\u25BC  OPEN CAMERAS  \u25BC", H - 14);
-	}
-
+	// ---------- HUD (shared by office and cameras) ----------
 	private void drawHud(Graphics2D g) {
-		g.setFont(MONO);
-		g.setColor(Color.WHITE);
-		g.drawString(game.getClockText(), W - 140, 85);
-		g.drawString("Power: " + (int) Math.ceil(game.getPower()) + "%", W - 260, 125);
-		StringBuilder bars = new StringBuilder();
-		for (int i = 0; i < game.getUsage(); i++) bars.append('\u2588');
-		g.drawString("Usage: " + bars, W - 260, 155);
-		int w = (int) game.getWaterLevel();
-		g.drawString("Water: " + w + "%", W - 260, 185);
-		g.setColor(new Color(40, 110, 200));
-		g.fillRect(W - 260, 195, (int) (200 * w / 100.0), 12);
-		g.setColor(Color.WHITE);
-		g.drawRect(W - 260, 195, 200, 12);
-		if (game.hasAlert()) {
-			g.setColor(Color.YELLOW);
-			g.setFont(MONO);
-			center(g, game.getAlert(), H - 70);
-		}
-	}
+		// top-centre: water level as a battery-style gauge (FNAF 2 homage)
+		UI.battery(g, W / 2 - 150, 44, 96, 40, game.getWaterLevel() / 100.0, new Color(60, 140, 230));
+		UI.text(g, "WATER " + (int) game.getWaterLevel() + "%", W / 2 - 32, 72, 20, Color.WHITE);
 
-	private void drawStatic(Graphics2D g, String msg) {
-		for (int i = 0; i < 900; i++) {
-			int v = rng.nextInt(255);
-			g.setColor(new Color(v, v, v, 160));
-			g.fillRect(rng.nextInt(W), rng.nextInt(H), 6, 3);
+		// top-right: clock and night
+		UI.textRight(g, game.getClockText(), RIGHT_EDGE, 88, 48, Color.WHITE);
+		UI.textRight(g, "Night 1", RIGHT_EDGE, 122, 22, Color.WHITE);
+
+		// bottom-left: power and usage
+		int pw = (int) Math.ceil(game.getPower());
+		Color pc = pw <= 20 && ((int) (clock * 3) % 2 == 0) ? new Color(255, 70, 70) : Color.WHITE;
+		UI.text(g, "Power left: " + pw + "%", 55, H - 78, 26, pc);
+		UI.text(g, "Usage:", 55, H - 42, 26, Color.WHITE);
+		UI.usageBars(g, 175, H - 66, game.getUsage());
+
+		// alerts appear as a bordered box at the top centre (like the MUTE CALL button)
+		if (game.hasAlert()) {
+			String s = game.getAlert();
+			int w = UI.textWidth(g, s, 20) + 36;
+			UI.box(g, new Rectangle(W / 2 - w / 2, 104, w, 40), s);
 		}
-		g.setColor(Color.WHITE);
-		g.setFont(MONO);
-		center(g, msg, H / 2);
 	}
 
 	private void drawJumpscare(Graphics2D g) {
 		if (jumpscare != null) g.drawImage(jumpscare, 0, 0, W, H, null);
 		g.setColor(new Color(150, 0, 0, 160));
 		g.fillRect(0, 0, W, H);
-		g.setColor(Color.WHITE);
-		g.setFont(BIG);
-		center(g, "YOU DROWNED", H / 2 - 20);
-		g.setFont(MONO);
-		center(g, "An alligator found you in the flood...", H / 2 + 30);
-	}
-
-	private void center(Graphics2D g, String s, int y) {
-		g.drawString(s, (W - g.getFontMetrics().stringWidth(s)) / 2, y);
+		UI.textCenter(g, "YOU DROWNED", W / 2, H / 2 - 20, 70, Color.WHITE);
+		UI.textCenter(g, "An alligator found you in the flood...", W / 2, H / 2 + 30, 24, Color.WHITE);
 	}
 
 	public static void main(String[] args) {
@@ -464,9 +616,9 @@ public class Main extends JPanel {
 			f.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
 			f.setContentPane(new Main());
 			f.pack();
-			f.setResizable(false);
 			f.setLocationRelativeTo(null);
 			f.setVisible(true);
+			if (START_FULLSCREEN) setFullscreen(f, true);
 		});
 	}
 }

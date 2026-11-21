@@ -39,13 +39,11 @@ public class FloodEngine {
 	/** OVERLOADED constructor: custom difficulty multiplier. */
 	public FloodEngine(double difficulty) {
 		this.difficulty = difficulty;
-		areas.add(new Area("RUBBLE LOT", "cam1.png"));
-		areas.add(new Area("GREEN HOUSE", "cam2.png"));
-		areas.add(new LowLyingArea("MAIN ROAD", "cam3.png"));
-		areas.add(new LowLyingArea("CREEK BANK", "cam4.png"));
-		areas.add(new Area("MARKET ALLEY", "cam5.png"));
-		areas.add(new HighGroundArea("BARANGAY GATE", "cam6.png"));
-
+		areas.add(new Area("RUBBLE LOT", "cam1.png"));                // CAM 1 top-left
+		areas.add(new Area("GREEN HOUSE", "cam2.png"));               // CAM 2 top-right
+		areas.add(new LowLyingArea("CANAL", "cam3.png"));             // CAM 3 canal
+		areas.add(new HighGroundArea("OFFICE ROAD", "cam4.png"));     // CAM 4 lower-left
+		areas.add(new LowLyingArea("BASKETBALL COURT", "cam5.png"));  // CAM 5 lower-right
 		hazards.add(new BlackoutHazard(0.003));
 		hazards.add(new WindowHazard(0.006));
 		hazards.add(new PipeBurstHazard(0.006));
